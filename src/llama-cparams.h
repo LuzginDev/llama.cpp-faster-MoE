@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-les.h"
 
 #include <cstdint>
 #include <vector>
@@ -56,6 +57,9 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    float   moe_cache_prior; // cache-aware MoE routing: lambda in [0, 1], 0 = disabled
+
+    llama_les_params les; // Lookahead Experts Scheduler, see llama-les.h
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

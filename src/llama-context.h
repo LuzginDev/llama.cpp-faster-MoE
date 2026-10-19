@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-les.h"
 #include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
@@ -308,6 +309,7 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    llama_les_ptr les; // lookahead experts scheduler, uses moe_cache for the device prefetches
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

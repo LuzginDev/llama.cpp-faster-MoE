@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "ggml-cuda-les.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -6161,6 +6162,28 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    // LES - Lookahead Experts Scheduler, see src/llama-les.h
+    if (strcmp(name, "ggml_backend_cuda_les_new") == 0) {
+        return (void *)ggml_backend_cuda_les_new;
+    }
+    if (strcmp(name, "ggml_backend_cuda_les_begin") == 0) {
+        return (void *)ggml_backend_cuda_les_begin;
+    }
+    if (strcmp(name, "ggml_backend_cuda_les_copy") == 0) {
+        return (void *)ggml_backend_cuda_les_copy;
+    }
+    if (strcmp(name, "ggml_backend_cuda_les_end") == 0) {
+        return (void *)ggml_backend_cuda_les_end;
+    }
+    if (strcmp(name, "ggml_backend_cuda_les_done") == 0) {
+        return (void *)ggml_backend_cuda_les_done;
+    }
+    if (strcmp(name, "ggml_backend_cuda_les_wait") == 0) {
+        return (void *)ggml_backend_cuda_les_wait;
+    }
+    if (strcmp(name, "ggml_backend_cuda_les_free") == 0) {
+        return (void *)ggml_backend_cuda_les_free;
     }
     return nullptr;
 }

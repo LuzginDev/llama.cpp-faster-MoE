@@ -360,6 +360,32 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    // the CLI validates the range, the API does not, and a negative lambda would demote the cached
+    // experts instead of promoting them
+    cparams.moe_cache_prior = std::clamp(params.moe_cache_prior, 0.0f, 1.0f);
+
+    {
+        llama_les_params & les = cparams.les;
+
+        les.enabled        = params.les != 0;
+        les.n_threads      = params.les_n_threads; // 0 = auto
+        les.budget_bytes   = params.les_budget_bytes;
+        les.coverage       = params.les_coverage       > 0 ? params.les_coverage       : 1.0f;
+        les.min_prob       = params.les_min_prob; // < 0 selects the threshold of each path
+        les.depth_max      = params.les_depth_max;
+        les.calib_interval = params.les_calib_interval >= 0 ? params.les_calib_interval : 32;
+        les.markov_k       = params.les_markov_k       >= 0 ? params.les_markov_k       : 16;
+        les.cpu_mode       = params.les_cpu_mode;
+        les.staging_bytes  = params.les_staging_bytes  > 0 ? params.les_staging_bytes  : 32ull*1024*1024;
+        les.n_staging      = params.les_n_staging      > 0 ? params.les_n_staging      : 2;
+        les.verbose        = params.les_verbose != 0;
+
+        les.prior          = cparams.moe_cache_prior;
+        les.prior_fallback = params.les_prior_fallback != 0;
+        les.prior_miss     = params.les_prior_miss != 0 ? params.les_prior_miss == 1
+                                                         : cparams.moe_cache_prior > 0.0f;
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -549,7 +575,28 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size,
+                    cparams.moe_cache_prior);
+        }
+
+        if (cparams.moe_cache_prior > 0.0f && !moe_cache) {
+            LLAMA_LOG_WARN("%s: --moe-cache-prior needs --moe-cache-mib, the cache-aware routing is "
+                    "disabled\n", __func__);
+        }
+
+        if (cparams.les.enabled) {
+            les = std::make_unique<llama_les>(model, cparams.les, moe_cache.get(), backend_cpu);
+
+            if (moe_cache) {
+                // the cache reports the selection of each layer and reserves the slots that the
+                // scheduler predicted
+                moe_cache->set_les(les.get());
+            } else if (cparams.moe_cache_size == 0 && !backend_ptrs.empty() &&
+                       ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[0])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                LLAMA_LOG_WARN("%s: LES is enabled but the MoE cache is not, the experts of the "
+                        "host-resident layers are uploaded by the graph itself. Use --moe-cache-mib "
+                        "to prefetch them ahead of time\n", __func__);
+            }
         }
 
         sched_reserve();
@@ -1511,6 +1558,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // LES safe point: the graph of the previous ubatch has been computed and its outputs have been
+    // read, nothing is in flight. The experts that this ubatch is predicted to select are handed
+    // to the workers here, so that they are loaded while the graph below is being built and run.
+    // note: synchronize the scheduler directly, llama_context::synchronize() would account the
+    //       compute of the previous ubatch twice and skew the reported timings
+    if (les) {
+        ggml_backend_sched_synchronize(sched.get());
+        les->step(ubatch.n_tokens);
+    }
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1572,6 +1629,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // the taps of LES can be read at the next safe point
+    if (les) {
+        les->end_compute();
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2700,6 +2762,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.les         =*/ les.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -4002,6 +4065,21 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_prior             =*/ 0.0f,
+        /*.les                         =*/ 0,
+        /*.les_n_threads               =*/ 0,
+        /*.les_depth_max               =*/ 0,
+        /*.les_calib_interval          =*/ -1,
+        /*.les_markov_k                =*/ -1,
+        /*.les_cpu_mode                =*/ LLAMA_LES_CPU_MADVISE,
+        /*.les_n_staging               =*/ 0,
+        /*.les_verbose                 =*/ 0,
+        /*.les_budget_bytes            =*/ 0,
+        /*.les_staging_bytes           =*/ 0,
+        /*.les_coverage                =*/ 0.0f,
+        /*.les_min_prob                =*/ -1.0f,
+        /*.les_prior_fallback          =*/ 0,
+        /*.les_prior_miss              =*/ -1,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

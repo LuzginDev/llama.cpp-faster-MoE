@@ -2788,6 +2788,193 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-prior"}, "F",
+        string_format("cache-aware MoE routing: lambda in [0.0, 1.0]. Adds lambda*delta to the router scores of the "
+                      "experts that are already in the --moe-cache-mib cache, where delta is the largest score of the "
+                      "token, so that the router prefers them and fewer experts have to be read from the host memory. "
+                      "It changes which experts are selected, never the weights they are combined with, and the best "
+                      "expert of the router stays selected at any lambda, so 0.0 is the original routing and 1.0 is "
+                      "the fastest routing that still follows the router where it is confident "
+                      "(ref: arXiv:2412.00099) (default: %.1f, disabled)",
+                      (double) params.moe_cache_prior),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_prior = std::stof(value);
+            if (params.moe_cache_prior < 0.0f || params.moe_cache_prior > 1.0f) {
+                throw std::invalid_argument("value must be in [0.0, 1.0]");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PRIOR"));
+
+    //
+    // LES - Lookahead Experts Scheduler (see docs/les.md)
+    //
+
+    add_opt(common_arg(
+        {"--les"},
+        string_format("enable the Lookahead Experts Scheduler: predict from the router scores of the "
+                "hidden state which experts the next token selects and load them while the current "
+                "token is still being computed. requires the MoE weights in the CPU (-ncmoe/-cmoe), "
+                "on a GPU also --moe-cache-mib (default: %s)", params.les.enabled ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.les.enabled = true;
+        }
+    ).set_env("LLAMA_ARG_LES"));
+    add_opt(common_arg(
+        {"--les-threads"}, "N",
+        "number of workers that issue the LES prefetches, they run at a low priority, "
+        "0 = one per 8 cores, at most 4 (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 64) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.n_threads = value;
+        }
+    ).set_env("LLAMA_ARG_LES_THREADS"));
+    add_opt(common_arg(
+        {"--les-budget-mib"}, "N",
+        string_format("MiB of experts prefetched to the device per token, 0 = auto: 1/8 of the MoE "
+                "cache, at most 64 MiB (default: %zu)", params.les.budget_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.budget_mib = (size_t) value;
+        }
+    ).set_env("LLAMA_ARG_LES_BUDGET_MIB"));
+    add_opt(common_arg(
+        {"--les-coverage"}, "F",
+        string_format("expected fraction of the selected experts that the prefetch covers, the depth "
+                "of the prediction is adapted to reach it (default: %.2f)", (double) params.les.coverage),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f <= 0.0f || f > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.coverage = f;
+        }
+    ).set_env("LLAMA_ARG_LES_COVERAGE"));
+    add_opt(common_arg(
+        {"--les-min-prob"}, "F",
+        "do not prefetch an expert whose probability of being selected is below this, 0 = always "
+        "prefetch the whole predicted depth. by default the threshold is automatic: 0.15 for the "
+        "experts that are uploaded to a device, 0.50 for the pages that are read from the CPU, "
+        "where a wasted prefetch competes with the compute for the same storage device",
+
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.min_prob = f;
+        }
+    ).set_env("LLAMA_ARG_LES_MIN_PROB"));
+    add_opt(common_arg(
+        {"--les-depth"}, "N",
+        string_format("max number of experts predicted per layer, 0 = auto: 4x the top-k of the model "
+                "(default: %d)", params.les.depth_max),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.depth_max = value;
+        }
+    ).set_env("LLAMA_ARG_LES_DEPTH"));
+    add_opt(common_arg(
+        {"--les-calib"}, "N",
+        string_format("recalibrate the predictor every N tokens, 0 = keep the initial weights "
+                "(default: %d)", params.les.calib_interval),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.calib_interval = value;
+        }
+    ).set_env("LLAMA_ARG_LES_CALIB"));
+    add_opt(common_arg(
+        {"--les-markov"}, "N",
+        string_format("successors kept per expert by the transition prior of the predictor, 0 = off "
+                "(default: %d)", params.les.markov_k),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 256) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.markov_k = value;
+        }
+    ).set_env("LLAMA_ARG_LES_MARKOV"));
+    add_opt(common_arg(
+        {"--les-cpu-mode"}, "{off,madvise,touch,both}",
+        "how the pages of the experts that are read from the CPU are warmed:\n"
+        "- off: do not warm them, only prefetch to a device\n"
+        "- madvise (default): ask the kernel to read the pages ahead, does not use a core\n"
+        "- touch: read the pages on a worker, they are resident when the compute needs them\n"
+        "- both: madvise and touch",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.les.cpu_mode = LLAMA_LES_CPU_OFF;
+            } else if (value == "madvise") {
+                params.les.cpu_mode = LLAMA_LES_CPU_MADVISE;
+            } else if (value == "touch") {
+                params.les.cpu_mode = LLAMA_LES_CPU_TOUCH;
+            } else if (value == "both") {
+                params.les.cpu_mode = LLAMA_LES_CPU_BOTH;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_LES_CPU_MODE"));
+    add_opt(common_arg(
+        {"--les-staging-mib"}, "N",
+        string_format("size in MiB of each pinned staging buffer of the CUDA prefetch engine "
+                "(default: %zu)", params.les.staging_mib),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 4096) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.staging_mib = (size_t) value;
+        }
+    ).set_env("LLAMA_ARG_LES_STAGING_MIB"));
+    add_opt(common_arg(
+        {"--les-staging-n"}, "N",
+        string_format("number of pinned staging buffers per device of the CUDA prefetch engine "
+                "(default: %d)", params.les.n_staging),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 32) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.n_staging = value;
+        }
+    ).set_env("LLAMA_ARG_LES_STAGING_N"));
+    add_opt(common_arg(
+        {"--les-prior-fallback"},
+        "apply --moe-cache-prior only in the layers where LES cannot make the whole selection of the "
+        "next token resident in time. The routing then stays original wherever the prefetch is "
+        "enough, and the deviation of the prior is paid only where it really saves a stall "
+        "(default: off, the prior is applied in every cached layer)",
+        [](common_params & params) {
+            params.les.prior_fallback = true;
+        }
+    ).set_env("LLAMA_ARG_LES_PRIOR_FALLBACK"));
+    add_opt(common_arg(
+        {"--les-prior-miss"}, "N",
+        string_format("with --moe-cache-prior: 1 = LES predicts the selection that the biased router "
+                "will make and prefetches only the experts it leaves out of the cache, which is "
+                "usually the best expert of the router alone, 0 = LES predicts the original "
+                "selection (default: %d, auto = 1 when the prior is on)", params.les.prior_miss),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.les.prior_miss = value;
+        }
+    ).set_env("LLAMA_ARG_LES_PRIOR_MISS"));
+    add_opt(common_arg(
+        {"--les-verbose"},
+        "log every step of the Lookahead Experts Scheduler",
+        [](common_params & params) {
+            params.les.verbose = true;
+        }
+    ).set_env("LLAMA_ARG_LES_VERBOSE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

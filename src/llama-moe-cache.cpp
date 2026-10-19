@@ -1,11 +1,13 @@
 #include "llama-moe-cache.h"
 
 #include "llama-impl.h"
+#include "llama-les.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -19,6 +21,19 @@ struct moe_cache_slru {
 
     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
+
+    // lookahead prefetch, see llama-les.h: a reserved slot belongs to the token that is about to be
+    // computed and plan() does not hand it out, a speculative slot is one that LES filled and that
+    // the model has not selected yet
+    std::vector<int8_t> resv;
+    std::vector<int8_t> spec;
+
+    // set by plan() when it had to take a slot back from the lookahead scheduler
+    bool stole_reserved = false;
+
+    uint64_t n_spec_hit    = 0; // speculations that the model selected, at any later step
+    uint64_t n_spec_used   = 0; // reservations that the step they were made for used
+    uint64_t n_spec_unused = 0; // reservations that the step they were made for did not use
 
     // probation and protected LRU lists; hits promote slots to the protected half
     std::vector<int32_t> prev;
@@ -37,6 +52,8 @@ struct moe_cache_slru {
         this->n_slots  = n_slots;
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
+        resv.assign(n_slots, 0);
+        spec.assign(n_slots, 0);
         prev.resize(n_slots);
         next.resize(n_slots);
         for (int32_t s = 0; s < n_slots; ++s) {
@@ -85,12 +102,27 @@ struct moe_cache_slru {
         }
     }
 
-    int32_t victim(int32_t il) const {
-        for (int segment = 0; segment < 2; ++segment) {
-            for (int32_t s = head[segment]; s >= 0; s = next[s]) {
-                const int32_t key = key_of[s];
-                // keep every expert selected by this request, including earlier fills
-                if (key < 0 || key / n_expert != il || seen[key % n_expert] != seen_gen) {
+    // the slot to give to an expert that is not cached: the probation segment first, then the
+    // protected one. A slot that the lookahead scheduler reserved for the token in flight is only
+    // taken as a last resort, and then stole is set so that the caller waits for the prefetch that
+    // writes it before overwriting it.
+    int32_t victim(int32_t il, bool allow_reserved, bool & stole) const {
+        stole = false;
+
+        const int n_pass = allow_reserved ? 2 : 1;
+        for (int pass = 0; pass < n_pass; ++pass) {
+            const bool may_steal = pass == 1;
+            for (int segment = 0; segment < 2; ++segment) {
+                for (int32_t s = head[segment]; s >= 0; s = next[s]) {
+                    const int32_t key = key_of[s];
+                    // keep every expert selected by this request, including earlier fills
+                    if (key >= 0 && key / n_expert == il && seen[key % n_expert] == seen_gen) {
+                        continue;
+                    }
+                    if (resv[s] && !may_steal) {
+                        continue;
+                    }
+                    stole = resv[s] != 0;
                     return s;
                 }
             }
@@ -130,6 +162,10 @@ struct moe_cache_slru {
         // promote hits before choosing victims for misses
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
+                if (spec[slots[e]]) {
+                    n_spec_hit++; // a speculation of the lookahead scheduler paid off
+                }
+                spec[slots[e]] = 0; // it is used, it is not a speculation any more
                 touch(slots[e]);
                 n_hit++;
             }
@@ -140,16 +176,72 @@ struct moe_cache_slru {
             if (slots[e] >= 0) {
                 continue;
             }
-            const int32_t s = victim(il);
+            const int32_t s = victim(il, true, stole_reserved);
             if (key_of[s] >= 0) {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
             }
             key_of[s] = il*n_expert + e;
             slots[e] = s;
+            spec[s]  = 0;
             move(s, false);
             fills.push_back({ e, s });
         }
         return true;
+    }
+
+    // give a slot to each of the experts that the lookahead scheduler predicted, without touching
+    // the reservations of the step in flight. The experts that are already cached are skipped, the
+    // next plan() counts them as hits. The fills go to the probation segment, so a speculation that
+    // does not pay off is the first thing to be evicted.
+    bool reserve(int32_t il, const int32_t * ids, size_t n_ids, size_t max_fills, std::vector<fill> & fills) {
+        fills.clear();
+
+        int32_t * slots = slot_map[il];
+        if (slots == nullptr || max_fills == 0) {
+            return false;
+        }
+
+        // the experts of the previous request are not being planned any more, they can be evicted
+        if (++seen_gen == 0) {
+            std::fill(seen.begin(), seen.end(), 0);
+            seen_gen = 1;
+        }
+
+        for (size_t i = 0; i < n_ids && fills.size() < max_fills; ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= n_expert || slots[e] >= 0) {
+                continue;
+            }
+            bool stole = false;
+            const int32_t s = victim(il, false, stole);
+            GGML_UNUSED(stole);
+            if (key_of[s] >= 0) {
+                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+            }
+            key_of[s] = il*n_expert + e;
+            slots[e]  = s;
+            resv[s]   = 1;
+            spec[s]   = 1;
+            move(s, false);
+            fills.push_back({ e, s });
+        }
+
+        return true;
+    }
+
+    // the step of the lookahead scheduler is over, its reservations are not needed any more
+    void release() {
+        for (int32_t s = 0; s < n_slots; ++s) {
+            if (resv[s]) {
+                // plan() clears the flag of the slots that the model really selected
+                if (spec[s]) {
+                    n_spec_unused++;
+                } else {
+                    n_spec_used++;
+                }
+                resv[s] = 0;
+            }
+        }
     }
 };
 
@@ -182,6 +274,12 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+}
+
+void llama_moe_cache_prior_mask(const int32_t * slots, int32_t n_expert, float * mask) {
+    for (int32_t e = 0; e < n_expert; ++e) {
+        mask[e] = slots[e] >= 0 ? 1.0f : 0.0f;
+    }
 }
 
 struct llama_moe_cache::impl {
@@ -231,9 +329,15 @@ struct llama_moe_cache::impl {
 
     int32_t n_expert_used;
 
+    float prior_lam = 0.0f;        // cache-aware routing: lambda, 0 = disabled
+    std::vector<char> prior_layer; // [n_layer] the layers that were routed with the cache prior
+
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+
+    // experts reserved by the lookahead scheduler: hits counts the reservations, bytes the uploads
+    stats stats_prefetch;
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -243,6 +347,10 @@ struct llama_moe_cache::impl {
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_slru::fill> fills;
+    std::vector<moe_cache_slru::fill> fills_prefetch;
+
+    // the lookahead scheduler that reserves slots ahead of time, may be null
+    llama_les * les = nullptr;
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -252,8 +360,9 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float prior) :
+            n_expert_used(model.hparams.n_expert_used_max()), prior_lam(prior),
+            prior_layer(model.layers.size(), 0), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -362,7 +471,12 @@ struct llama_moe_cache::impl {
             n_tensors_host  += g.layers.size();
         }
         if (n_tensors_host == 0) {
-            throw std::runtime_error("MoE cache is too small to hold the experts of one token");
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "the MoE cache of %.2f MiB cannot hold the experts of a single token of any layer: "
+                "use a larger --moe-cache-mib, or keep the experts of a few layers on the device with --n-cpu-moe",
+                size/1024.0/1024.0);
+            throw std::runtime_error(msg);
         }
 
         auto init_ctx = [](size_t n_tensors) {
@@ -506,6 +620,28 @@ struct llama_moe_cache::impl {
         return l.slot_map;
     }
 
+    float prior() const {
+        return prior_lam;
+    }
+
+    bool is_cached(int32_t il) const {
+        return il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0;
+    }
+
+    const int32_t * get_cached_slots(int32_t il) const {
+        if (!is_cached(il)) {
+            return nullptr;
+        }
+        return groups[layers[il].ig].slru.slot_map[il];
+    }
+
+    int32_t n_expert(int32_t il) const {
+        if (!is_cached(il) || layers[il].slot_map == nullptr) {
+            return 0;
+        }
+        return (int32_t) layers[il].slot_map->ne[1];
+    }
+
     ggml_tensor * get_experts(const ggml_tensor * w) const {
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
@@ -581,11 +717,29 @@ struct llama_moe_cache::impl {
 
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+
+        // LES reads the router scores of this layer back with the same synchronization
+        if (les != nullptr) {
+            les->capture_async(il, backend);
+        }
+
         ggml_backend_synchronize(backend);
 
+        if (les != nullptr) {
+            les->observe_ids(il, ids.data(), ids.size());
+        }
+
         size_t n_hit = 0;
+        g.slru.stole_reserved = false;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+
+        if (les != nullptr) {
+            // The plan may have adopted slots that LES reserved for this step. Their upload runs on
+            // a stream of its own, so the compute stream must not read them before it landed, and a
+            // slot that had to be taken back must not be written by two streams at once.
+            les->settle_uploads();
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
@@ -610,10 +764,106 @@ struct llama_moe_cache::impl {
         st.misses += fills.size();
         st.bytes  += bytes;
 
+        if (prior_lam > 0.0f && ids.size() <= (size_t) 8*n_expert_used) {
+            prior_layer[il] = 1;
+        }
+
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
 
         return true;
+    }
+
+    //
+    // lookahead prefetch, used by LES (see llama-les.h)
+    //
+
+    void set_les(llama_les * les) {
+        this->les = les;
+    }
+
+    bool prefetch_layer(int32_t il) const {
+        return is_cached(il) && groups[layers[il].ig].n_slots > 0;
+    }
+
+    size_t prefetch_expert_bytes(int32_t il) const {
+        if (!prefetch_layer(il)) {
+            return 0;
+        }
+        size_t res = 0;
+        for (const ggml_tensor * t : layers[il].experts) {
+            res += t->nb[2];
+        }
+        return res;
+    }
+
+    void prefetch_resident(int32_t il, std::vector<int8_t> & resident) const {
+        if (!prefetch_layer(il)) {
+            return;
+        }
+        const group & g = groups[layers[il].ig];
+        const int32_t * slots = g.slru.slot_map[il];
+        if (slots == nullptr) {
+            return;
+        }
+        const size_t n = std::min<size_t>(resident.size(), (size_t) g.slru.n_expert);
+        for (size_t e = 0; e < n; ++e) {
+            resident[e] = slots[e] >= 0 ? 1 : 0;
+        }
+    }
+
+    size_t prefetch_reserve(int32_t il, const int32_t * ids, size_t n_ids, size_t max_bytes,
+                            std::vector<llama_moe_cache::prefetch_copy> & copies) {
+        if (!prefetch_layer(il)) {
+            return 0;
+        }
+
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+
+        const size_t expert_bytes = prefetch_expert_bytes(il);
+        if (expert_bytes == 0 || expert_bytes > max_bytes) {
+            return 0;
+        }
+
+        // never reserve more than half of the slots, the synchronous path needs room for the experts
+        // that the model selects
+        const size_t max_fills = std::min({ n_ids, (size_t) std::max(1, g.n_slots/2), max_bytes/expert_bytes });
+        if (max_fills == 0) {
+            return 0;
+        }
+
+        if (!g.slru.reserve(il, ids, n_ids, max_fills, fills_prefetch)) {
+            return 0;
+        }
+
+        size_t planned = 0;
+        for (const auto & f : fills_prefetch) {
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w = l.experts[ip];
+                ggml_tensor * bank = g.banks[ip];
+
+                copies.push_back({
+                    devices[g.id].backend,
+                    bank,
+                    (size_t) f.slot*bank->nb[2],
+                    (const uint8_t *) w->data + (size_t) f.expert*w->nb[2],
+                    w->nb[2],
+                });
+
+                planned += w->nb[2];
+            }
+            stats_prefetch.hits++;
+        }
+        stats_prefetch.bytes += planned;
+
+        return planned;
+    }
+
+    void prefetch_release() {
+        for (group & g : groups) {
+            g.slru.release();
+        }
     }
 
     void log_stats() const {
@@ -627,17 +877,55 @@ struct llama_moe_cache::impl {
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
+        if (prior_lam > 0.0f) {
+            size_t n_routed = 0;
+            for (char c : prior_layer) {
+                n_routed += c != 0;
+            }
+            LLAMA_LOG_INFO("llama_moe_cache: cache prior: lambda = %.2f, routed %zu/%zu cached layers\n",
+                prior_lam, n_routed, prior_layer.size());
+        }
+        {
+            uint64_t n_used = 0, n_unused = 0, n_hit = 0;
+            for (const group & g : groups) {
+                n_used   += g.slru.n_spec_used;
+                n_unused += g.slru.n_spec_unused;
+                n_hit    += g.slru.n_spec_hit;
+            }
+            if (n_used + n_unused > 0) {
+                LLAMA_LOG_INFO("llama_moe_cache: lookahead: %zu experts reserved, %.2f MiB uploaded ahead of "
+                        "time, %.2f%% of the reservations were used by the next token, %llu speculative hits\n",
+                        stats_prefetch.hits, stats_prefetch.bytes/1024.0/1024.0,
+                        100.0*(double) n_used/(double) (n_used + n_unused), (unsigned long long) n_hit);
+            }
+        }
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float prior) :
+    pimpl(new impl(model, backends, bufts, size, prior)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
+
+float llama_moe_cache::prior() const {
+    return pimpl->prior();
+}
+
+bool llama_moe_cache::is_cached(int32_t il) const {
+    return pimpl->is_cached(il);
+}
+
+const int32_t * llama_moe_cache::get_cached_slots(int32_t il) const {
+    return pimpl->get_cached_slots(il);
+}
+
+int32_t llama_moe_cache::n_expert(int32_t il) const {
+    return pimpl->n_expert(il);
+}
 
 ggml_backend_t llama_moe_cache::backend(int32_t il) const {
     return pimpl->backend(il);
@@ -657,6 +945,30 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+void llama_moe_cache::set_les(llama_les * les) {
+    pimpl->set_les(les);
+}
+
+bool llama_moe_cache::prefetch_layer(int32_t il) const {
+    return pimpl->prefetch_layer(il);
+}
+
+size_t llama_moe_cache::prefetch_expert_bytes(int32_t il) const {
+    return pimpl->prefetch_expert_bytes(il);
+}
+
+void llama_moe_cache::prefetch_resident(int32_t il, std::vector<int8_t> & resident) const {
+    pimpl->prefetch_resident(il, resident);
+}
+
+size_t llama_moe_cache::prefetch_reserve(int32_t il, const int32_t * ids, size_t n_ids, size_t max_bytes, std::vector<prefetch_copy> & copies) {
+    return pimpl->prefetch_reserve(il, ids, n_ids, max_bytes, copies);
+}
+
+void llama_moe_cache::prefetch_release() {
+    pimpl->prefetch_release();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

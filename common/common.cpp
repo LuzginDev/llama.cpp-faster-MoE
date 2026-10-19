@@ -1744,7 +1744,23 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size  = params.moe_cache_size;
+    cparams.moe_cache_prior = params.moe_cache_prior;
+
+    cparams.les                = params.les.enabled ? 1 : 0;
+    cparams.les_n_threads      = params.les.n_threads;
+    cparams.les_depth_max      = params.les.depth_max;
+    cparams.les_calib_interval = params.les.calib_interval;
+    cparams.les_markov_k       = params.les.markov_k;
+    cparams.les_cpu_mode       = params.les.cpu_mode;
+    cparams.les_n_staging      = params.les.n_staging;
+    cparams.les_verbose        = params.les.verbose ? 1 : 0;
+    cparams.les_budget_bytes   = params.les.budget_mib*1024*1024;
+    cparams.les_staging_bytes  = params.les.staging_mib*1024*1024;
+    cparams.les_coverage       = params.les.coverage;
+    cparams.les_min_prob       = params.les.min_prob;
+    cparams.les_prior_fallback = params.les.prior_fallback ? 1 : 0;
+    cparams.les_prior_miss     = params.les.prior_miss;
 
     return cparams;
 }

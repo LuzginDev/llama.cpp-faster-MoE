@@ -222,6 +222,14 @@ extern "C" {
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
+    // how LES warms the pages of the experts that are read from host memory
+    enum llama_les_cpu_mode {
+        LLAMA_LES_CPU_OFF     = 0, // do not warm the host pages, only prefetch to a device
+        LLAMA_LES_CPU_MADVISE = 1, // ask the kernel to read the pages ahead, does not use a core
+        LLAMA_LES_CPU_TOUCH   = 2, // read the pages on a worker, forces them to be resident
+        LLAMA_LES_CPU_BOTH    = 3, // madvise and touch
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -397,6 +405,40 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+
+        // cache-aware MoE routing ("cache prior"), only used when moe_cache_size > 0 [EXPERIMENTAL]
+        // adds lambda*delta to the router scores of the experts that are already in the device cache, where delta is
+        // the largest score of the token, so that the router prefers them: this trades a small deviation from the
+        // original expert selection for fewer cache misses, i.e. less host -> device traffic. Only the ranking of the
+        // experts changes, never the weights they are combined with, and the best expert of the router stays selected
+        // at any lambda.
+        // ref: Skliar et al., "Mixture of Cache-Conditional Experts for Efficient Mobile Device Inference", arXiv:2412.00099
+        float   moe_cache_prior; // lambda in [0, 1]: 0 = the original routing (default), 1 = the fastest routing that
+                                 // still selects the expert the router likes most in every layer
+
+        // LES - Lookahead Experts Scheduler [EXPERIMENTAL]
+        // predicts from the router scores of the hidden state which experts the next token is going
+        // to select, and loads them while the current token is still being computed. The experts
+        // have to be kept in host memory (--n-cpu-moe/--cpu-moe), on a GPU they are uploaded ahead
+        // of time into the MoE cache (--moe-cache-mib), on a CPU their pages are warmed ahead of
+        // time. See docs/les.md
+        int32_t les;                // 0 = disabled, 1 = enabled
+        int32_t les_n_threads;      // workers that issue the prefetches, 0 = auto
+        int32_t les_depth_max;      // max experts predicted per layer, 0 = auto (4*n_expert_used)
+        int32_t les_calib_interval; // steps between two predictor calibrations, 0 = never
+        int32_t les_markov_k;       // successors kept per expert by the transition prior, 0 = off
+        int32_t les_cpu_mode;       // enum llama_les_cpu_mode
+        int32_t les_n_staging;      // pinned staging buffers per device, 0 = default
+        int32_t les_verbose;        // log every prefetch step
+        size_t  les_budget_bytes;   // device bytes prefetched per token, 0 = auto
+        size_t  les_staging_bytes;  // size of a pinned staging buffer, 0 = default
+        float   les_coverage;       // expected fraction of the selected experts to cover, 0 = default
+        float   les_min_prob;       // do not prefetch an expert that is less likely to be used, 0 = default
+        int32_t les_prior_fallback; // apply the cache prior only in the layers where LES expects a miss it could not
+                                    // prefetch in time, so that the routing stays original wherever LES is enough
+        int32_t les_prior_miss;     // 1 = predict the selection that the cache prior will produce and prefetch only
+                                    // the experts it leaves out, 0 = predict the original selection, -1 = auto (1 when
+                                    // moe_cache_prior > 0)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

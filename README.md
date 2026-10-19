@@ -111,6 +111,8 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [Build on Android](docs/android.md)
 - [Multi-GPU usage](docs/multi-gpu.md)
 - [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
+- [MoE lookahead](docs/moe-lookahead.md) - the cache-aware routing and the Lookahead Experts Scheduler
+- [Lookahead Experts Scheduler (LES)](docs/les.md) - prefetch the MoE experts of the next token
 - [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
 - [XCFramework](docs/xcframework.md)
 - [Completions](docs/completions.md)

@@ -597,6 +597,27 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
+    // cache-aware MoE routing (arXiv:2412.00099), requires moe_cache_size > 0
+    float   moe_cache_prior = 0.0f; // lambda in [0, 1]: favor the experts already in the MoE cache, 0 = off
+
+    // LES - Lookahead Experts Scheduler, see docs/moe-lookahead.md
+    struct les_params {
+        bool        enabled        = false;
+        int32_t     n_threads      = 0; // 0 = auto
+        int32_t     depth_max      = 0;
+        int32_t     calib_interval = 32;
+        int32_t     markov_k       = 16;
+        int32_t     cpu_mode       = LLAMA_LES_CPU_MADVISE;
+        int32_t     n_staging      = 2;
+        bool        verbose        = false;
+        size_t      budget_mib     = 0;
+        size_t      staging_mib    = 32;
+        float       coverage       = 1.0f;
+        float       min_prob       = -1.0f; // < 0: automatic, see llama_les_params
+        bool        prior_fallback = false; // apply the cache prior only where LES expects a stall
+        int32_t     prior_miss     = -1;    // 1: predict through the prior, 0: not, -1: auto
+    } les;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

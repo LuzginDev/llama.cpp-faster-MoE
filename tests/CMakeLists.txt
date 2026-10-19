@@ -134,6 +134,15 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# cache-aware MoE routing: the host side mask and the graph side bias, no model is needed
+llama_build_and_test(test-moe-cache-prior.cpp LINK ggml llama)
+target_include_directories(test-moe-cache-prior PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+# LES: the predictor of the Lookahead Experts Scheduler, no model is needed
+llama_build(test-les-predictor.cpp ${PROJECT_SOURCE_DIR}/src/llama-les-predictor.cpp)
+target_include_directories(test-les-predictor PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-les-predictor NAME test-les-predictor LABEL les)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
